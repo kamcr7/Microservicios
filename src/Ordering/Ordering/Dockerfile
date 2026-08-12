@@ -4,10 +4,10 @@ EXPOSE 8080
 
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
-COPY ["src/Services/Ordering/Ordering.csproj", "src/Services/Ordering/"]
-RUN dotnet restore "src/Services/Ordering/Ordering.csproj"
+COPY ["src/Ordering/Ordering/Ordering.csproj", "src/Ordering/Ordering/"]
+RUN dotnet restore "src/Ordering/Ordering/Ordering.csproj"
 COPY . .
-WORKDIR "/src/src/Services/Ordering"
+WORKDIR "/src/src/Ordering/Ordering"
 RUN dotnet build "Ordering.csproj" -c Release -o /app/build
 
 FROM build AS publish
