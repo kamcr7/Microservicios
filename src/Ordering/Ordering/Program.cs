@@ -5,21 +5,25 @@ using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Configurar Swagger y CORS
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+
+// 1. Configuración de la política CORS
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowAll", p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
+    options.AddPolicy("AllowAll", p => p
+        .AllowAnyOrigin()
+        .AllowAnyHeader()
+        .AllowAnyMethod());
 });
 
-// Registrar cliente de MongoDB leyendo variable de entorno
 var mongoConnectionString = builder.Configuration["ConnectionStrings:MongoDb"]
     ?? Environment.GetEnvironmentVariable("ConnectionStrings__MongoDb")
     ?? "mongodb://localhost:27017";
 
 var mongoClient = new MongoClient(mongoConnectionString);
 var database = mongoClient.GetDatabase("OrderingDb");
+
 builder.Services.AddSingleton(database);
 builder.Services.AddHttpClient();
 
@@ -27,68 +31,80 @@ var app = builder.Build();
 
 app.UseSwagger();
 app.UseSwaggerUI();
+
+// 2. Activar Middleware CORS explícitamente
 app.UseCors("AllowAll");
 
-// --- ENDPOINTS DE LA API ---
-
-// P1, P3, P4: Generar Orden de Compra
+// POST /api/orders (Generar Orden de Compra)
 app.MapPost("/api/orders", async (
     [FromBody] CreateOrderRequest request,
     [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
     IMongoDatabase db,
-    IHttpClientFactory clientFactory) =>
+    IHttpClientFactory clientFactory,
+    IConfiguration config) =>
 {
     var ordersCollection = db.GetCollection<Order>("Orders");
 
-    // 1. Validar Idempotencia (P4)
     if (!string.IsNullOrEmpty(idempotencyKey))
     {
         var existingOrder = await ordersCollection.Find(o => o.IdempotencyKey == idempotencyKey).FirstOrDefaultAsync();
-        if (existingOrder != null)
+        if (existingOrder != null) return Results.Ok(existingOrder);
+    }
+
+    List<OrderItem> orderItems = new();
+
+    // 1. PRIORIDAD ALTA: Usar ítems enviados directamente por el Frontend
+    if (request.Items != null && request.Items.Any())
+    {
+        orderItems = request.Items.Select(i => new OrderItem
         {
-            return Results.Ok(existingOrder);
+            ProductId = string.IsNullOrEmpty(i.ProductId) ? "prod-1" : i.ProductId,
+            ProductName = string.IsNullOrEmpty(i.ProductName) ? "Producto" : i.ProductName,
+            Quantity = i.Quantity > 0 ? i.Quantity : 1,
+            UnitPrice = i.UnitPrice > 0 ? i.UnitPrice : i.Price,
+            LineTotal = (i.UnitPrice > 0 ? i.UnitPrice : i.Price) * (i.Quantity > 0 ? i.Quantity : 1)
+        }).ToList();
+    }
+    else
+    {
+        // 2. FALLBACK: Intentar obtener desde la API de Basket (Redis)
+        try
+        {
+            var client = clientFactory.CreateClient();
+            var baseUrl = config["BasketApiUrl"] ?? "https://basket-api-cma3.onrender.com";
+            var basketUrl = $"{baseUrl.TrimEnd('/')}/api/basket/{request.CustomerId}";
+
+            var response = await client.GetAsync(basketUrl);
+            if (response.IsSuccessStatusCode)
+            {
+                var basketResponse = await response.Content.ReadFromJsonAsync<BasketResponseDto>();
+                var basket = basketResponse?.Cart ?? basketResponse;
+                if (basket?.Items != null && basket.Items.Any())
+                {
+                    orderItems = basket.Items.Select(item => {
+                        var price = item.UnitPrice > 0 ? item.UnitPrice : item.Price;
+                        return new OrderItem
+                        {
+                            ProductId = item.ProductId ?? "prod-1",
+                            ProductName = item.ProductName ?? "Producto",
+                            Quantity = item.Quantity,
+                            UnitPrice = price,
+                            LineTotal = price * item.Quantity
+                        };
+                    }).ToList();
+                }
+            }
         }
+        catch { }
     }
 
-    // 2. Obtener Basket desde el Microservicio de Basket en producción
-    var client = clientFactory.CreateClient();
-    var basketUrl = $"https://basket-api-cma3.onrender.com/basket/{request.CustomerId}";
-
-    HttpResponseMessage response;
-    try
-    {
-        response = await client.GetAsync(basketUrl);
-    }
-    catch
-    {
-        return Results.Problem("Error al conectar con el microservicio de Basket.", statusCode: 500);
-    }
-
-    if (!response.IsSuccessStatusCode)
-    {
-        return Results.BadRequest(new { error = "No se pudo obtener el basket del cliente." });
-    }
-
-    var basket = await response.Content.ReadFromJsonAsync<BasketDto>();
-
-    // 3. Validar Basket Vacío (P3)
-    if (basket == null || basket.Items == null || !basket.Items.Any())
+    if (!orderItems.Any())
     {
         return Results.BadRequest(new { error = "El Basket está vacío. No se puede generar la orden." });
     }
 
-    // 4. Calcular Totales y Crear la Orden
-    var orderItems = basket.Items.Select(item => new OrderItem
-    {
-        ProductId = item.ProductId,
-        ProductName = item.ProductName,
-        Quantity = item.Quantity,
-        UnitPrice = item.UnitPrice,
-        LineTotal = item.UnitPrice * item.Quantity
-    }).ToList();
-
     var subtotal = orderItems.Sum(i => i.LineTotal);
-    var tax = subtotal * 0.16m; // 16% IVA
+    var tax = subtotal * 0.16m;
     var total = subtotal + tax;
 
     var order = new Order
@@ -103,29 +119,24 @@ app.MapPost("/api/orders", async (
         Total = total
     };
 
-    // 5. Persistir en MongoDB Atlas (P1)
     await ordersCollection.InsertOneAsync(order);
-
     return Results.Created($"/api/orders/{order.Id}", order);
-});
+}).RequireCors("AllowAll"); // 👈 OBLIGATORIO para interceptar las peticiones OPTIONS preflight
 
-// P2: Consultar Orden por ID
 app.MapGet("/api/orders/{id}", async (string id, IMongoDatabase db) =>
 {
     var ordersCollection = db.GetCollection<Order>("Orders");
     var order = await ordersCollection.Find(o => o.Id == id).FirstOrDefaultAsync();
     return order != null ? Results.Ok(order) : Results.NotFound(new { error = "Orden no encontrada." });
-});
+}).RequireCors("AllowAll");
 
-// Consultar Órdenes por Cliente
 app.MapGet("/api/orders/customer/{customerId}", async (string customerId, IMongoDatabase db) =>
 {
     var ordersCollection = db.GetCollection<Order>("Orders");
     var orders = await ordersCollection.Find(o => o.CustomerId == customerId).ToListAsync();
     return Results.Ok(orders);
-});
+}).RequireCors("AllowAll");
 
-// P5, P6: Cambiar Estado de Orden (Transiciones de estado)
 app.MapPatch("/api/orders/{id}/status", async (string id, [FromBody] UpdateStatusRequest req, IMongoDatabase db) =>
 {
     var ordersCollection = db.GetCollection<Order>("Orders");
@@ -133,7 +144,6 @@ app.MapPatch("/api/orders/{id}/status", async (string id, [FromBody] UpdateStatu
 
     if (order == null) return Results.NotFound(new { error = "Orden no encontrada." });
 
-    // Validar reglas de transición: Pending -> Confirmed, Pending -> Cancelled
     if (order.Status == "Cancelled")
     {
         return Results.BadRequest(new { error = "Una orden Cancelada no puede cambiar de estado." });
@@ -149,11 +159,11 @@ app.MapPatch("/api/orders/{id}/status", async (string id, [FromBody] UpdateStatu
 
     order.Status = req.Status;
     return Results.Ok(order);
-});
+}).RequireCors("AllowAll");
 
 app.Run();
 
-// --- MODELOS Y DTOS (SIEMPRE AL FINAL DEL ARCHIVO EN MINIMAL API) ---
+// Modelos DTO
 public class Order
 {
     [BsonId]
@@ -178,7 +188,23 @@ public class OrderItem
     public decimal LineTotal { get; set; }
 }
 
-public record CreateOrderRequest(string CustomerId, string BasketId);
+public record CreateOrderRequest(string CustomerId, string BasketId, List<OrderItemInputDto>? Items = null);
+public record OrderItemInputDto(string? ProductId, string? ProductName, decimal UnitPrice, decimal Price, int Quantity);
 public record UpdateStatusRequest(string Status);
-public record BasketDto(string BuyerId, List<BasketItemDto> Items);
-public record BasketItemDto(string ProductId, string ProductName, decimal UnitPrice, int Quantity);
+
+public class BasketResponseDto
+{
+    public string? BuyerId { get; set; }
+    public string? UserName { get; set; }
+    public List<BasketItemDto> Items { get; set; } = new();
+    public BasketResponseDto? Cart { get; set; }
+}
+
+public class BasketItemDto
+{
+    public string? ProductId { get; set; }
+    public string? ProductName { get; set; }
+    public decimal UnitPrice { get; set; }
+    public decimal Price { get; set; }
+    public int Quantity { get; set; }
+}
