@@ -8,7 +8,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// 1. Configuración de la política CORS
+// 1. Definir la política CORS
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", p => p
@@ -32,10 +32,15 @@ var app = builder.Build();
 app.UseSwagger();
 app.UseSwaggerUI();
 
-// 2. Activar Middleware CORS explícitamente
+// 2. Colocar UseCors INMEDIATAMENTE antes del enrutamiento
+app.UseRouting();
 app.UseCors("AllowAll");
 
-// POST /api/orders (Generar Orden de Compra)
+// 3. INTERCEPTOR GLOBAL DE OPTIONS: Responde 200 OK a cualquier Preflight inmediatamente
+app.MapMethods("{*path}", new[] { "OPTIONS" }, () => Results.Ok())
+   .RequireCors("AllowAll");
+
+// POST /api/orders
 app.MapPost("/api/orders", async (
     [FromBody] CreateOrderRequest request,
     [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
@@ -53,7 +58,6 @@ app.MapPost("/api/orders", async (
 
     List<OrderItem> orderItems = new();
 
-    // 1. PRIORIDAD ALTA: Usar ítems enviados directamente por el Frontend
     if (request.Items != null && request.Items.Any())
     {
         orderItems = request.Items.Select(i => new OrderItem
@@ -67,7 +71,6 @@ app.MapPost("/api/orders", async (
     }
     else
     {
-        // 2. FALLBACK: Intentar obtener desde la API de Basket (Redis)
         try
         {
             var client = clientFactory.CreateClient();
@@ -121,7 +124,7 @@ app.MapPost("/api/orders", async (
 
     await ordersCollection.InsertOneAsync(order);
     return Results.Created($"/api/orders/{order.Id}", order);
-}).RequireCors("AllowAll"); // 👈 OBLIGATORIO para interceptar las peticiones OPTIONS preflight
+}).RequireCors("AllowAll");
 
 app.MapGet("/api/orders/{id}", async (string id, IMongoDatabase db) =>
 {
@@ -163,7 +166,7 @@ app.MapPatch("/api/orders/{id}/status", async (string id, [FromBody] UpdateStatu
 
 app.Run();
 
-// Modelos DTO
+// DTOs y Clases
 public class Order
 {
     [BsonId]
