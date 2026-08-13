@@ -17,8 +17,6 @@ builder.Services.AddMediatR(cfg =>
     cfg.AddOpenBehavior(typeof(ValidationBehavior<,>));
 });
 builder.Services.AddValidatorsFromAssembly(typeof(Program).Assembly);
-
-
 builder.Services.AddMarten(opts =>
 {
     opts.Connection(builder.Configuration.GetConnectionString("Database")!);
@@ -27,28 +25,26 @@ builder.Services.AddMarten(opts =>
 
 builder.Services.AddScoped<IBasketRepository, BasketRepository>();
 
-//aqui agregams el patron de dise�o decorador mediante la libreria scrutor, configuramos redis para cache distri
+// Decorador e integración con Redis
 builder.Services.Decorate<IBasketRepository, CacheBasketRepository>();
 builder.Services.AddStackExchangeRedisCache(options =>
 {
     options.Configuration = builder.Configuration.GetConnectionString("Redis");
 });
 
+// Configuración de CORS permisiva para producción/despliegues
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("Frontend", policy =>
     {
-        policy.WithOrigins(builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [])
-            .AllowAnyHeader()
-            .AllowAnyMethod();
+        policy.AllowAnyOrigin()
+              .AllowAnyHeader()
+              .AllowAnyMethod();
     });
 });
 
 builder.Services.AddExceptionHandler<CustomExceptionHandler>();
 builder.Services.AddProblemDetails();
-
-builder.Services.AddExceptionHandler<CustomExceptionHandler>();
-
 builder.Services.AddHealthChecks()
     .AddNpgSql(builder.Configuration.GetConnectionString("Database")!)
     .AddRedis(builder.Configuration.GetConnectionString("Redis")!);
@@ -56,15 +52,11 @@ builder.Services.AddHealthChecks()
 var app = builder.Build();
 
 app.UseCors("Frontend");
-
 app.MapCarter();
 app.UseExceptionHandler(options => { });
-
 app.UseHealthChecks("/health", new HealthCheckOptions
-
 {
     ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
-
 });
 
 app.Run();
